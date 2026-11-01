@@ -15,14 +15,14 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       RUST_TEST_THREADS: "1"
       WGPU_BACKEND: vulkan
-      EXPECTED_SOURCE_SHA: "1c22e816c86f9b694441d37bf977c3783b7407fd"
+      EXPECTED_SOURCE_SHA: "3967efe65ab44b755e76874446cb38bc51bf32ad"
       CARGO_CACHE_AUTO_CLEAN_FREQUENCY: "never"
       NEXTEST_TEST_THREADS: "1"
       RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: "1c22e816c86f9b694441d37bf977c3783b7407fd"
+          ref: "3967efe65ab44b755e76874446cb38bc51bf32ad"
           persist-credentials: false
       - name: Prepare runtime environment before tool setup
         shell: bash
@@ -167,7 +167,7 @@ jobs:
       - name: Upload two native captures and provenance
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: provider-ui-designcraft-1c22e816c86f
+          name: provider-ui-designcraft-3967efe65ab4
           path: |
             ${{ runner.temp }}/provider-evidence/design-home-local-es.png
             ${{ runner.temp }}/provider-evidence/design-home-provider-es.png
