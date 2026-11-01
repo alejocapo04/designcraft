@@ -1,6 +1,6 @@
 # Fork-only validation recipe. Never part of the upstream feature PR.
 # The product checkout is the immutable published feature commit, not this QA branch.
-name: Provider bridge regression QA
+name: Provider native QA
 on:
   workflow_dispatch:
 permissions:
@@ -8,21 +8,21 @@ permissions:
 jobs:
   native:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 240
     env:
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       RUST_TEST_THREADS: "1"
       WGPU_BACKEND: vulkan
-      EXPECTED_SOURCE_SHA: "47a117e9a1b6aa96027b9700bc8a0f0ecea66d00"
+      EXPECTED_SOURCE_SHA: "1c22e816c86f9b694441d37bf977c3783b7407fd"
       CARGO_CACHE_AUTO_CLEAN_FREQUENCY: "never"
       NEXTEST_TEST_THREADS: "1"
       RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: "47a117e9a1b6aa96027b9700bc8a0f0ecea66d00"
+          ref: "1c22e816c86f9b694441d37bf977c3783b7407fd"
           persist-credentials: false
       - name: Prepare runtime environment before tool setup
         shell: bash
@@ -63,23 +63,79 @@ jobs:
           test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
           install -d -m 700 "$TMPDIR" "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$EVIDENCE_DIR"
           mkdir -p qa-output artifacts
-      - name: "Validate published source formatting before compilation"
+          cat > qa-output/design-home.jsonl <<'PROVIDER_QA_FILE'
+          {"empty":true}
+          {"providerRecents":false}
+          {"method":"engine.execute","params":{"command":"app.language","params":{"lang":"es"}}}
+          {"shot":"/tmp/design-home-local-es.png"}
+          {"method":"engine.execute","params":{"command":"app.language","params":{"lang":""}}}
+          {"providerRecents":true}
+          {"method":"engine.execute","params":{"command":"app.language","params":{"lang":"es"}}}
+          {"shot":"/tmp/design-home-provider-es.png"}
+          
+          PROVIDER_QA_FILE
+      - name: "Format before compilation"
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import base64,json,pathlib,subprocess
-          result=subprocess.run(['cargo','fmt','--all','--','--check'])
-          if result.returncode:
-              subprocess.run(['cargo','fmt','--all'],check=True)
-              paths=subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()
-              for raw in paths:
-                  p=pathlib.Path(raw)
-                  assert p.suffix=='.rs'
-                  print('PROVIDER_RUSTFMT_FILE '+json.dumps({'path':raw,'base64':base64.b64encode(p.read_bytes()).decode()}),flush=True)
-              raise SystemExit(result.returncode)
+          timeout 5m cargo fmt --all -- --check
+      - name: "Clippy of all affected native targets"
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 55m cargo clippy --locked -p designcraft-ui-egui -p designcraft-web --all-targets --keep-going -j2 -- -D warnings
+      - name: "All affected native tests on restored published source"
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 65m cargo test --locked -p designcraft-ui-egui -p designcraft-web --lib --bins --tests -j2 -- --test-threads=1
+      - name: "Prove target isolation, nonactivating ACK and UI-draft regressions reject the old behavior"
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 70m python3 - <<'PY'
+          import os,pathlib,subprocess
+          p=pathlib.Path('crates/ui-egui/src/file_provider_app.rs')
+          original=p.read_bytes()
+          text=original.decode('utf-8')
+          def once(source,old,new):
+              assert source.count(old)==1, 'Unexpected mutation anchor: '+old
+              return source.replace(old,new,1)
+          cases=[]
+          global_guard=once(text,'    let index = match id {','    if matches!(id, "file.close" | "file.revert") && app.file_providers.busy() { return Err("regression: global provider guard".into()); }\n    let index = match id {')
+          cases.append(('global-busy',global_guard,'file_provider_app::tests::pending_a_guards_only_a_while_b_can_close_in_each_save_phase'))
+          activation=once(text,'    if status == "saved" && alive {\n        for snapshot in &capture.snapshots {','    if status == "saved" && alive {\n        let regression_previous = app.session.active_index();\n        if let Some(index) = app.session.documents().iter().position(|doc| doc.uid == capture.doc) {\n            let _ = app.session.execute("file.activate", &json!({"index":index}));\n        }\n        for snapshot in &capture.snapshots {')
+          activation=once(activation,'    }\n    // Release the captured owner first.','        if let Some(index) = regression_previous {\n            let _ = app.session.execute("file.activate", &json!({"index":index}));\n        }\n    }\n    // Release the captured owner first.')
+          cases.append(('ack-activation',activation,'file_provider_app::tests::checkpoint_and_typed_close_preserve_b_composition_and_preview_without_activating_a'))
+          draft=once(text,'drafts::pending(ctx, (after.uid, after.identity_epoch))','false')
+          cases.append(('pending-ui-draft',draft,'file_provider_app::ui_tests::raw_numeric_input_in_the_ack_frame_keeps_a_open_even_before_engine_revision_changes'))
+          for name,mutated,test in cases:
+              try:
+                  p.write_bytes(mutated.encode('utf-8'))
+                  result=subprocess.run(['cargo','test','--locked','-p','designcraft-ui-egui','--lib',test,'-j2','--','--exact','--test-threads=1'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,env=dict(os.environ,CARGO_TERM_COLOR='never'),timeout=2400)
+                  (pathlib.Path(os.environ['EVIDENCE_DIR'])/(name+'-negative.log')).write_text(result.stdout)
+                  expected='test '+test+' ... FAILED'
+                  assert result.returncode!=0 and expected in result.stdout, 'Must fail in the actual regression, not compilation/zero tests: '+result.stdout[-10000:]
+                  print('CONFIRMED_NEGATIVE '+name+' '+test,flush=True)
+                  print(result.stdout[-3500:],flush=True)
+              finally:
+                  p.write_bytes(original)
+              assert p.read_bytes()==original
+              subprocess.run(['git','diff','--exit-code','--',str(p)],check=True)
+          # Positive run is made again against the exact restored published source.
+          subprocess.run(['cargo','test','--locked','-p','designcraft-ui-egui','--lib','file_provider','-j2','--','--test-threads=1'],check=True,timeout=2400)
           PY
-      - name: Verify tested source identity
+      - name: "Actual browser WASM package"
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 40m cargo check --locked -p designcraft-web --target wasm32-unknown-unknown -j2
+      - name: "Render local and provider Home with the official Spanish locale"
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 30m cargo run --locked -p designcraft-ui-egui --example ui_shot -j2 -- qa-output/design-home.jsonl
+      - name: Verify native evidence and source identity
         shell: bash
         run: |
           python3 - <<'PY'
@@ -92,8 +148,8 @@ jobs:
           fonts_sha = subprocess.check_output(['git','-C','craft-fonts','rev-parse','HEAD'],text=True).strip() if pathlib.Path('craft-fonts/.git').exists() else None
           assert fonts_sha == "b076417b5880bd4154bd22f00695b1d28c6bea83"
           rustc = subprocess.check_output(['rustc','-Vv'],text=True)
-          files = []
-          assert len(files) == 0
+          files = ["/tmp/design-home-local-es.png","/tmp/design-home-provider-es.png"]
+          assert len(files) == 2
           proof = []
           for raw in files:
               source = pathlib.Path(os.path.expandvars(raw))
@@ -104,15 +160,17 @@ jobs:
               target = out / source.name
               if source.resolve() != target.resolve(): shutil.copy2(source,target)
               proof.append(dict(file=target.name,width=width,height=height,bytes=len(data),sha256=hashlib.sha256(data).hexdigest()))
-          provenance = dict(source_sha=actual,fonts_sha=fonts_sha,rustc=rustc,workflow_sha=os.environ.get('GITHUB_SHA'),run_id=os.environ.get('GITHUB_RUN_ID'),renderer='focused bridge regression validation; no new image capture',browser_backend_e2e=False,images=proof)
+          provenance = dict(source_sha=actual,fonts_sha=fonts_sha,rustc=rustc,workflow_sha=os.environ.get('GITHUB_SHA'),run_id=os.environ.get('GITHUB_RUN_ID'),renderer='repository native offscreen renderer; synthetic resources',browser_backend_e2e=False,images=proof)
           (out / 'provenance.json').write_text(json.dumps(provenance,indent=2)+chr(10))
           print(json.dumps(provenance))
           PY
-      - name: Upload tested source provenance
+      - name: Upload two native captures and provenance
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: provider-checks-designcraft-47a117e9a1b6
+          name: provider-ui-designcraft-1c22e816c86f
           path: |
+            ${{ runner.temp }}/provider-evidence/design-home-local-es.png
+            ${{ runner.temp }}/provider-evidence/design-home-provider-es.png
             ${{ runner.temp }}/provider-evidence/provenance.json
           if-no-files-found: error
           retention-days: 14
